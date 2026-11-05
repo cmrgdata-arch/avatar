@@ -10,6 +10,8 @@ import {
 import { useAuth } from "../../context/AuthContext";
 import { useSession } from "../../context/SessionContext";
 import AppImuStatusStrip from "../../Components/app/AppImuStatusStrip";
+import mlPoseService from "../../services/mlPoseService";
+import dlPoseService from "../../services/dlPoseService";
 import "../../Pages/HardwarePage.css";
 import "./AppPages.css";
 
@@ -42,10 +44,17 @@ const AppHardwarePage = () => {
     let cancelled = false;
     (async () => {
       try {
-        const mediaStream = await navigator.mediaDevices.getUserMedia({
-          video: { width: 1920, height: 1080 },
-          audio: false,
-        });
+        void mlPoseService.releaseCamera();
+        void dlPoseService.releaseCamera();
+        let mediaStream = null;
+        try {
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false,
+          });
+        } catch {
+          mediaStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        }
         if (cancelled) {
           mediaStream.getTracks().forEach((t) => t.stop());
           return;

@@ -155,6 +155,28 @@ pip install -r requirements.txt
 python server.py
 ```
 
+
+## 6. Pose Estimation Services (DL & ML)
+
+YogaTwin-AI includes a dedicated **Pose Estimation** module accessible from the home screen (/pose-estimation).
+It provides two independent model paradigms:
+
+| Engine | Model Type | Hierarchy / Classes | Port | Startup Script |
+|--------|------------|---------------------|------|----------------|
+| **DL (Deep Learning)** | Keras Spatial-Temporal ConvLSTM | 8 Core Asanas (60-frame video sequence) | 5005 | start_dl_service.bat or python run_dl_service.py |
+| **ML (Machine Learning)** | Multi-Level LightGBM Classifiers | 6 Categories / 20 Groups / 82 Asanas | 5006 | start_ml_service.bat or python run_ml_service.py |
+
+### Start Pose Estimation Services
+
+`ash
+# To start both engines together:
+start_all_pose_services.bat
+
+# Or start individually:
+python run_dl_service.py  # DL Engine on port 5005
+python run_ml_service.py  # ML Engine on port 5006
+`
+
 ## Quick start (all services)
 
 Open four terminals:

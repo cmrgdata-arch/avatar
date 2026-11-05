@@ -7,7 +7,7 @@ export default defineConfig(({ mode }) => {
 
   // Target of the standalone Yoga Pose Correction engine (Node + tfjs-node).
   // Override with CORRECTION_ENGINE_URL when the engine runs elsewhere.
-  const correctionTarget = env.CORRECTION_ENGINE_URL || 'http://127.0.0.1:3002'
+  const correctionTarget = env.CORRECTION_ENGINE_URL || 'http://127.0.0.1:3000'
 
   return {
     plugins: [react()],

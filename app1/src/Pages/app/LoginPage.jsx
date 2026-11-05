@@ -7,7 +7,7 @@ const API_BASE = "http://127.0.0.1:3001";
 
 const LoginPage = () => {
   const navigate = useNavigate();
-  const { login } = useAuth();
+  const { login, isAuthenticated, currentUser, logout } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -36,7 +36,19 @@ const LoginPage = () => {
 
   return (
     <div className="app-auth-shell"><div className="auth-orb auth-orb--one"/><div className="auth-orb auth-orb--two"/><div className="auth-grid"/><form className="app-card auth-card app-form-wrap" onSubmit={handleSubmit}>
-        <h1>Welcome back</h1><p className="auth-intro">Continue your mindful movement journey.</p>
+                <h1>Welcome back</h1><p className="auth-intro">Continue your mindful movement journey.</p>
+        {isAuthenticated && (
+          <div className="alert alert-info py-2 small d-flex justify-content-between align-items-center mb-3">
+            <span>Currently logged in as <strong>{currentUser?.full_name || currentUser?.email || "cmrg"}</strong></span>
+            <button
+              type="button"
+              className="btn btn-outline-dark btn-sm py-0"
+              onClick={logout}
+            >
+              Log Out
+            </button>
+          </div>
+        )}
         <div className="mb-3">
           <label className="form-label" htmlFor="login-email">Email</label>
           <input id="login-email" className="form-control" type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />

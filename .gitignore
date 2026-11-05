@@ -1,5 +1,26 @@
+node_modules
 node_modules/
+**/node_modules
 **/node_modules/
+correction-engine/node_modules
+correction-engine/node_modules/
+app1/node_modules
+app1/node_modules/
+server/node_modules
+server/node_modules/
+
+venv
+venv/
+**/venv
+**/venv/
+.venv
+.venv/
+**/.venv
+**/.venv/
+
+__pycache__/
+**/__pycache__/
+*.py[cod]
 
 .env
 **/.env
@@ -10,13 +31,3 @@ node_modules/
 .ipynb_checkpoints/
 
 backend/gdrive_service_account.json.git-broken-backup/
-
-# Dependencies
-node_modules/
-**/node_modules/
-
-# Node dependencies
-**/node_modules/
-
-/correction-engine/node_modules/
-

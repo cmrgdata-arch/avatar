@@ -86,6 +86,20 @@ const Home = () => {
             </Link>
 
             <Link
+              to="/pose-estimation"
+              className="homeModuleCard homeModuleCard--pose"
+            >
+              <div className="module-icon">◈</div>
+
+              <div>
+                <b>Pose Estimation</b>
+                <p>Deep Learning &amp; ML analysis</p>
+              </div>
+
+              <strong>→</strong>
+            </Link>
+
+            <Link
               to="/app"
               className="homeModuleCard homeModuleCard--practice"
             >

@@ -6,12 +6,15 @@ import { useSession } from "../../context/SessionContext";
 import { useAppCollectionPose } from "../../hooks/useAppCollectionPose";
 import { useCorrectionEngine, CORRECTION_STATUS } from "../../hooks/useCorrectionEngine";
 import AppImuStatusStrip from "../../Components/app/AppImuStatusStrip";
+import mlPoseService from "../../services/mlPoseService";
+import dlPoseService from "../../services/dlPoseService";
 import CONFIG from "../../config";
 import { countActiveOnline, normalizeImuPollPayload } from "../../utils/sensorStatus";
 import { playCountdownBeep } from "../../utils/countdownBeep";
 import { startRecording, stopRecording } from "../../utils/recorder";
 import { getPoseMessages } from "../../data/poseMessages";
 import PoseInstructionDialog from "../../Components/PoseInstructionDialog";
+import { useCorrectiveTts } from "../../hooks/useCorrectiveTts";
 import "../../Pages/SequencerPage.css";
 import "../../Pages/Practice/PracticeSessionPage.css";
 import "./AppPages.css";
@@ -145,7 +148,7 @@ const AppPracticePage = () => {
     view === "practice" &&
     Boolean(selectedPose) &&
     cameraReady &&
-    recordPhase !== "done";
+    recordPhase === "recording";
 
   const {
     pushLandmarks,
@@ -164,15 +167,75 @@ const AppPracticePage = () => {
     userName: metadata?.name || currentUser?.username,
   });
 
+
+  // Text-To-Speech (TTS) Voice Output for Corrective Feedback
+  const engineUsableForTts =
+    correctionSupported &&
+    engineOnline &&
+    correctionStatus !== CORRECTION_STATUS.ERROR;
+
+  const currentTtsFeedback = useMemo(() => {
+    if (recordPhase !== "recording") return null;
+    if (engineUsableForTts) {
+      if (correctionStatus === CORRECTION_STATUS.GOOD_FORM) {
+        return correctionFeedback || "Looking good, hold the position";
+      }
+      if (engineCorrections && engineCorrections.length > 0) {
+        return engineCorrections;
+      }
+      return correctionFeedback || null;
+    }
+    if (corrections && corrections.length > 0) {
+      return corrections;
+    }
+    return null;
+  }, [
+    recordPhase,
+    engineUsableForTts,
+    correctionStatus,
+    correctionFeedback,
+    engineCorrections,
+    corrections,
+  ]);
+
+  useCorrectiveTts({
+    active: recordPhase === "recording",
+    feedback: currentTtsFeedback,
+  });
+
+  const handleRawLandmarks = useCallback(
+    (landmarks) => {
+      if (recordPhase === "recording") {
+        pushLandmarks(landmarks);
+      }
+    },
+    [recordPhase, pushLandmarks]
+  );
+
+  const handleSetCorrections = useCallback(
+    (newCorrections) => {
+      if (recordPhase === "recording") {
+        setCorrections(newCorrections);
+      }
+    },
+    [recordPhase]
+  );
+
   const { mediapipeError } = useAppCollectionPose({
     videoRef,
     canvasRef,
     enabled: posePipelineEnabled,
     practicePoseName: selectedPose?.name || "",
-    setDetectedPose,
-    setConfidence,
-    setCorrections,
-    onRawLandmarks: pushLandmarks,
+    setDetectedPose: (p) => {
+      if (recordPhase === "recording") setDetectedPose(p);
+      else setDetectedPose("—");
+    },
+    setConfidence: (c) => {
+      if (recordPhase === "recording") setConfidence(c);
+      else setConfidence(0);
+    },
+    setCorrections: handleSetCorrections,
+    onRawLandmarks: handleRawLandmarks,
   });
 
   const attachStream = useCallback((stream) => {
@@ -202,10 +265,17 @@ const AppPracticePage = () => {
 
     (async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: 1920, height: 1080 },
-          audio: false,
-        });
+        void mlPoseService.releaseCamera();
+        void dlPoseService.releaseCamera();
+        let stream = null;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false,
+          });
+        } catch {
+          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        }
         if (cancelled) {
           stream.getTracks().forEach((t) => t.stop());
           return;
@@ -581,75 +651,80 @@ const AppPracticePage = () => {
 
           {(recordPhase === "idle" || recordPhase === "recording") && (
             <div className="app-practice-side-panel">
-              {(() => {
-                const meta =
-                  CORRECTION_STATUS_META[correctionStatus] ||
-                  CORRECTION_STATUS_META.detecting;
-                // Prefer the real engine's match confidence; fall back to the
-                // local angle-based confidence only when the engine is offline.
-                const engineUsable =
-                  correctionSupported &&
-                  engineOnline &&
-                  correctionStatus !== CORRECTION_STATUS.ERROR;
-                const confPct =
-                  engineUsable && matchConfidence != null
-                    ? Math.round(matchConfidence * 100)
-                    : null;
-                // Which corrections to show: engine corrections when usable,
-                // otherwise the existing local angle corrections as a fallback.
-                const shownCorrections = engineUsable
-                  ? engineCorrections
-                  : corrections;
-                return (
-                  <>
-                    <div
-                      className={`app-correction-status ${meta.cls}`}
-                      role="status"
-                      aria-live="polite"
-                    >
-                      {meta.label}
-                    </div>
-
-                    {correctionStepText ? (
-                      <div className="app-correction-step small mb-2">
-                        {correctionStepText}
+              {recordPhase === "recording" ? (
+                (() => {
+                  const meta =
+                    CORRECTION_STATUS_META[correctionStatus] ||
+                    CORRECTION_STATUS_META.detecting;
+                  const engineUsable =
+                    correctionSupported &&
+                    engineOnline &&
+                    correctionStatus !== CORRECTION_STATUS.ERROR;
+                  const confPct =
+                    engineUsable && matchConfidence != null
+                      ? Math.round(matchConfidence * 100)
+                      : null;
+                  const shownCorrections = engineUsable
+                    ? engineCorrections
+                    : corrections;
+                  return (
+                    <>
+                      <div
+                        className={`app-correction-status ${meta.cls}`}
+                        role="status"
+                        aria-live="polite"
+                      >
+                        {meta.label}
                       </div>
-                    ) : null}
 
-                    <div className="small mb-1">
-                      Pose: {selectedPose?.name}
-                    </div>
-                    <div className="small mb-2">
-                      {confPct != null ? (
-                        <>Match confidence: {confPct}%</>
-                      ) : engineUsable ? (
-                        <>Match confidence: —</>
-                      ) : correctionSupported ? (
-                        <>Live correction unavailable (engine offline)</>
-                      ) : (
-                        <>Live AI correction not available for this pose</>
-                      )}
-                    </div>
+                      {correctionStepText ? (
+                        <div className="app-correction-step small mb-2">
+                          {correctionStepText}
+                        </div>
+                      ) : null}
 
-                    {engineUsable &&
-                    correctionStatus === CORRECTION_STATUS.GOOD_FORM ? (
-                      <div className="app-correction-feedback good small mb-2">
-                        {correctionFeedback || "Looking good — hold the position!"}
+                      <div className="small mb-1">
+                        Pose: {selectedPose?.name}
                       </div>
-                    ) : shownCorrections && shownCorrections.length > 0 ? (
-                      <ul className="app-correction-list small mb-2">
-                        {shownCorrections.slice(0, 3).map((c, i) => (
-                          <li key={i}>{c}</li>
-                        ))}
-                      </ul>
-                    ) : engineUsable && correctionFeedback ? (
-                      <div className="app-correction-feedback small mb-2">
-                        {correctionFeedback}
+                      <div className="small mb-2">
+                        {confPct != null ? (
+                          <>Match confidence: {confPct}%</>
+                        ) : engineUsable ? (
+                          <>Match confidence: —</>
+                        ) : correctionSupported ? (
+                          <>Live correction unavailable (engine offline)</>
+                        ) : (
+                          <>Live AI correction not available for this pose</>
+                        )}
                       </div>
-                    ) : null}
-                  </>
-                );
-              })()}
+
+                      {engineUsable &&
+                      correctionStatus === CORRECTION_STATUS.GOOD_FORM ? (
+                        <div className="app-correction-feedback good small mb-2">
+                          {correctionFeedback || "Looking good — hold the position!"}
+                        </div>
+                      ) : shownCorrections && shownCorrections.length > 0 ? (
+                        <ul className="app-correction-list small mb-2">
+                          {shownCorrections.slice(0, 3).map((c, i) => (
+                            <li key={i}>{c}</li>
+                          ))}
+                        </ul>
+                      ) : engineUsable && correctionFeedback ? (
+                        <div className="app-correction-feedback small mb-2">
+                          {correctionFeedback}
+                        </div>
+                      ) : null}
+                    </>
+                  );
+                })()
+              ) : (
+                <div className="p-3 text-center small text-muted border rounded bg-white mb-3">
+                  <div className="fw-semibold text-dark mb-1">Pose: {selectedPose?.name}</div>
+                  <p className="mb-0">
+                    Stand in camera view, then click <strong>● Start Recording</strong> below to begin posture tracking and real-time voice feedback.
+                  </p>
+                </div>
+              )}
 
               {recordPhase === "idle" ? (
                 <>

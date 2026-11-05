@@ -8,6 +8,9 @@ import { createSessionZip } from "../../utils/sessionExport";
 import { checkRecorderHealth } from "../../utils/sessionRecorderApi";
 import { getPoseMessages } from "../../data/poseMessages";
 import PoseInstructionDialog from "../../Components/PoseInstructionDialog";
+import { useCorrectiveTts } from "../../hooks/useCorrectiveTts";
+import mlPoseService from "../../services/mlPoseService";
+import dlPoseService from "../../services/dlPoseService";
 import "./PracticeSessionPage.css";
 
 const confidenceTone = (pct) => {
@@ -51,6 +54,9 @@ const PracticeSessionPage = () => {
   const [saving, setSaving] = useState(false);
   const [backendReady, setBackendReady] = useState(false);
   const [instructionPhase, setInstructionPhase] = useState(null);
+  const [videoDevices, setVideoDevices] = useState([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState("");
+  const [releasingServices, setReleasingServices] = useState(false);
 
   const stopCamera = useCallback(() => {
     streamRef.current?.getTracks().forEach((t) => t.stop());
@@ -150,12 +156,59 @@ const PracticeSessionPage = () => {
     }, 1000);
   }, [finalizeRecording]);
 
-  const initCamera = useCallback(async () => {
+  const initCamera = useCallback(async (forcedDeviceId = null) => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 1280, height: 720 },
-        audio: false,
-      });
+      // Release any background ML/DL Python services holding webcam
+      void mlPoseService.releaseCamera();
+      void dlPoseService.releaseCamera();
+
+      // Enumerate available camera ports/devices
+      let devices = [];
+      try {
+        if (navigator.mediaDevices?.enumerateDevices) {
+          const allDevs = await navigator.mediaDevices.enumerateDevices();
+          devices = allDevs.filter((d) => d.kind === "videoinput");
+          setVideoDevices(devices);
+        }
+      } catch (devErr) {
+        console.warn("Could not enumerate camera devices:", devErr);
+      }
+
+      const activeDevId = forcedDeviceId || selectedDeviceId || (devices[0]?.deviceId || undefined);
+
+      let stream = null;
+      // 1. Try with preferred resolution and device
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: activeDevId
+            ? { deviceId: { exact: activeDevId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+            : { width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false,
+        });
+      } catch (err1) {
+        // 2. Fallback: try other video devices if available
+        if (devices.length > 1) {
+          for (const dev of devices) {
+            if (dev.deviceId && dev.deviceId !== activeDevId) {
+              try {
+                stream = await navigator.mediaDevices.getUserMedia({
+                  video: { deviceId: { exact: dev.deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } },
+                  audio: false,
+                });
+                setSelectedDeviceId(dev.deviceId);
+                break;
+              } catch {
+                continue;
+              }
+            }
+          }
+        }
+        // 3. Fallback: standard unconstrained video
+        if (!stream) {
+          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        }
+      }
+
       streamRef.current = stream;
       setCameraError(null);
       if (videoRef.current) {
@@ -163,17 +216,33 @@ const PracticeSessionPage = () => {
       }
       return stream;
     } catch (e) {
-      setCameraError(
-        e?.message ||
-          "Camera access was denied or is unavailable. Allow camera permission to practice."
-      );
+      const isDeviceInUse = e?.name === "NotReadableError" || String(e?.message || "").toLowerCase().includes("in use");
+      const errorMsg = isDeviceInUse
+        ? "Device in use: Your webcam is locked by another process or background service. Click 'Release & Reconnect' below to free the camera."
+        : (e?.message || "Camera access was denied or is unavailable. Allow camera permission to practice.");
+      setCameraError(errorMsg);
       setSessionPhase("idle");
       setIsSessionActive(false);
       window.clearInterval(countdownRef.current);
       countdownRef.current = null;
       return null;
     }
-  }, [setIsSessionActive]);
+  }, [selectedDeviceId, setIsSessionActive]);
+
+  const handleReleaseAndRetry = useCallback(async () => {
+    setReleasingServices(true);
+    setCameraError(null);
+    try {
+      await mlPoseService.releaseCamera();
+      await dlPoseService.releaseCamera();
+    } catch (err) {
+      console.warn("Camera release call:", err);
+    }
+    setTimeout(() => {
+      setReleasingServices(false);
+      void initCamera();
+    }, 600);
+  }, [initCamera]);
 
   const beginRecording = useCallback(async () => {
     if (!pose || sessionPhase !== "idle") return;
@@ -282,14 +351,48 @@ const PracticeSessionPage = () => {
   const poseDetectionEnabled =
     !cameraError && !!pose && (sessionPhase === "recording" || sessionPhase === "idle");
 
+
+  // Text-To-Speech (TTS) Voice Output for Corrective Feedback
+  useCorrectiveTts({
+    active: sessionPhase === "recording",
+    feedback: corrections && corrections.length > 0 ? corrections : null,
+  });
+
+  const handleSetCorrections = useCallback(
+    (newCorrections) => {
+      if (sessionPhase === "recording") {
+        setCorrections(newCorrections);
+      }
+    },
+    [sessionPhase, setCorrections]
+  );
+
+  const handleSetConfidence = useCallback(
+    (conf) => {
+      if (sessionPhase === "recording") {
+        setConfidence(conf);
+      }
+    },
+    [sessionPhase, setConfidence]
+  );
+
+  const handleSetDetectedPose = useCallback(
+    (detected) => {
+      if (sessionPhase === "recording") {
+        setDetectedPose(detected);
+      }
+    },
+    [sessionPhase, setDetectedPose]
+  );
+
   const { mediapipeError } = usePracticePoseDetection({
     videoRef,
     canvasRef,
     enabled: poseDetectionEnabled,
     practicePoseName: pose?.name ?? "",
-    setDetectedPose,
-    setConfidence,
-    setCorrections,
+    setDetectedPose: handleSetDetectedPose,
+    setConfidence: handleSetConfidence,
+    setCorrections: handleSetCorrections,
   });
 
   const remaining = Math.max(0, MAX_RECORDING_SECONDS - elapsedSeconds);
@@ -380,8 +483,40 @@ const PracticeSessionPage = () => {
         <div className="col-12 col-lg-7">
           <div className="practice-session__video-wrap">
             {cameraError ? (
-              <div className="practice-session__camera-error alert alert-warning mb-0">
-                {cameraError}
+              <div className="practice-session__camera-error alert alert-warning mb-0 p-4">
+                <div className="d-flex align-items-center gap-2 mb-2">
+                  <strong className="fs-6">Camera Notice</strong>
+                </div>
+                <p className="mb-3">{cameraError}</p>
+                <div className="d-flex flex-wrap gap-2 align-items-center">
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-sm px-3"
+                    onClick={handleReleaseAndRetry}
+                    disabled={releasingServices}
+                  >
+                    {releasingServices ? "Releasing Hardware & Connecting..." : "Release & Reconnect Camera"}
+                  </button>
+
+                  {videoDevices.length > 0 && (
+                    <select
+                      className="form-select form-select-sm w-auto"
+                      value={selectedDeviceId}
+                      onChange={(e) => {
+                        const newId = e.target.value;
+                        setSelectedDeviceId(newId);
+                        void initCamera(newId);
+                      }}
+                      aria-label="Select camera port or device"
+                    >
+                      {videoDevices.map((dev, idx) => (
+                        <option key={dev.deviceId || idx} value={dev.deviceId}>
+                          {dev.label || `Camera Device / Port ${idx + 1}`}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
               </div>
             ) : (
               <>
@@ -394,6 +529,26 @@ const PracticeSessionPage = () => {
                   className="practice-session__video-inner"
                   style={{ position: "relative", width: "100%" }}
                 >
+                  {videoDevices.length > 1 && (
+                    <div style={{ position: "absolute", top: 8, right: 8, zIndex: 10 }}>
+                      <select
+                        className="form-select form-select-sm bg-dark text-white border-secondary"
+                        style={{ fontSize: "12px", opacity: 0.85 }}
+                        value={selectedDeviceId}
+                        onChange={(e) => {
+                          const newId = e.target.value;
+                          setSelectedDeviceId(newId);
+                          void initCamera(newId);
+                        }}
+                      >
+                        {videoDevices.map((dev, idx) => (
+                          <option key={dev.deviceId || idx} value={dev.deviceId}>
+                            {dev.label || `Camera Port ${idx + 1}`}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
                   <video
                     ref={videoRef}
                     className="practice-session__video"
@@ -456,7 +611,7 @@ const PracticeSessionPage = () => {
                 <p className="text-muted fst-italic small mb-0">{pose.sanskrit}</p>
               </div>
 
-              {sessionPhase !== "done" && (
+              {sessionPhase === "recording" ? (
                 <>
                   <div
                     className={`practice-session__detected p-3 rounded border ${confidenceTone(
@@ -483,7 +638,14 @@ const PracticeSessionPage = () => {
                     )}
                   </div>
                 </>
-              )}
+              ) : sessionPhase === "idle" || sessionPhase === "countdown" ? (
+                <div className="p-3 rounded border bg-light text-center small text-muted">
+                  <div className="fw-semibold text-dark mb-1">Ready to Practice</div>
+                  <p className="mb-0">
+                    Stand in camera view and click <strong>● Start Recording</strong> below to begin posture analysis and voice feedback.
+                  </p>
+                </div>
+              ) : null}
 
               <div className="practice-session__timer text-center py-3 border rounded">
                 {sessionPhase === "idle" ? (

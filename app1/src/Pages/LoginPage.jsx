@@ -37,15 +37,32 @@ const LoginPage = () => {
         <label className="field-label" htmlFor="username">
           Participant Username
         </label>
-        <input
-          id="username"
-          className="field-input"
-          type="text"
-          value={usernameInput}
-          onChange={(event) => setUsernameInput(event.target.value)}
-          placeholder="e.g. meera"
-          required
-        />
+        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+          <input
+            id="username"
+            className="field-input"
+            type="text"
+            value={usernameInput}
+            onChange={(event) => setUsernameInput(event.target.value)}
+            placeholder="e.g. meera"
+            required
+            style={{ flex: 1 }}
+          />
+          {usernameInput && (
+            <button
+              type="button"
+              className="secondary-btn"
+              style={{ whiteSpace: "nowrap", padding: "8px 12px", fontSize: "13px" }}
+              onClick={() => {
+                setUsernameInput("");
+                setUsername("");
+              }}
+              title="Clear participant username"
+            >
+              Clear
+            </button>
+          )}
+        </div>
 
         <label className="field-label" htmlFor="operatorName">
           Operator Name

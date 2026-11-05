@@ -213,6 +213,10 @@
   color: #0f2d52;
 }
 
+.homeModuleCard--pose {
+  background: rgba(238, 242, 255, 0.96);
+}
+
 .homeModuleCard--practice {
   background: rgba(233, 247, 242, 0.96);
 }
@@ -227,6 +231,10 @@
   background: #0f2d52;
   color: white;
   font-size: 1.8rem;
+}
+
+.homeModuleCard--pose .module-icon {
+  background: #2563eb;
 }
 
 .homeModuleCard--practice .module-icon {

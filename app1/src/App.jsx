@@ -33,6 +33,7 @@ import DashboardPage from "./Pages/app/DashboardPage";
 import AppHardwarePage from "./Pages/app/AppHardwarePage";
 import AppPracticePage from "./Pages/app/AppPracticePage";
 import HistoryPage from "./Pages/app/HistoryPage";
+import PoseEstimationPage from "./Pages/PoseEstimation/PoseEstimationPage";
 
 const App = () => {
   return (
@@ -58,6 +59,7 @@ const App = () => {
                   <Route path="yog6" element={<Yog6 />} />
                 </Route>
               </Route>
+              <Route path="/pose-estimation" element={<PoseEstimationPage />} />
               <Route path="/login" element={<LoginPage />} />
               <Route path="/practice/consent" element={<PracticeConsentPage />} />
               <Route

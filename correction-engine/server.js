@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
-import tf from '@tensorflow/tfjs-node';
+import * as tf from '@tensorflow/tfjs';
 import fs from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -288,7 +288,14 @@ let isUsingMockModel = false;
 async function loadModel() {
   if (fs.existsSync(LABELS_FILE) && fs.existsSync(join(MODEL_DIR, 'model.json'))) {
     try {
-      model = await tf.loadLayersModel(`file://${MODEL_DIR}/model.json`);
+      const modelJson = JSON.parse(fs.readFileSync(join(MODEL_DIR, 'model.json'), 'utf8'));
+      const weightSpecs = modelJson.weightsManifest[0].weights;
+      const weightData = new Uint8Array(fs.readFileSync(join(MODEL_DIR, modelJson.weightsManifest[0].paths[0]))).buffer;
+      model = await tf.loadLayersModel(tf.io.fromMemory({
+        modelTopology: modelJson.modelTopology,
+        weightSpecs,
+        weightData,
+      }));
       labels = JSON.parse(fs.readFileSync(LABELS_FILE, 'utf8'));
 
       if (fs.existsSync(MODEL_CONFIG_FILE)) {
@@ -547,13 +554,38 @@ function generateCorrectiveFeedback(liveDescriptors, refEntry) {
   return phrases;
 }
 
+function getDescriptorDeviations(liveDescriptors, refEntry) {
+  if (!refEntry || !refEntry.descriptors) return [];
+  const devs = [];
+  for (let i = 0; i < POSTURE_DESCRIPTOR_NAMES.length; i++) {
+    const name = POSTURE_DESCRIPTOR_NAMES[i];
+    if (SKIP_FOR_FEEDBACK.has(name)) continue;
+    const ref = refEntry.descriptors[name];
+    if (!ref) continue;
+    const spread = Math.max(ref.mad, descriptorStdFloor(name));
+    const z = (liveDescriptors[i] - ref.median) / spread;
+    if (Math.abs(z) >= FEEDBACK_Z_THRESHOLD) {
+      const fb = DESCRIPTOR_FEEDBACK[name];
+      devs.push({
+        name,
+        z: parseFloat(z.toFixed(3)),
+        liveValue: parseFloat(liveDescriptors[i].toFixed(4)),
+        targetMedian: parseFloat(ref.median.toFixed(4)),
+        phrase: fb ? (z < 0 ? fb.low : fb.high) : null
+      });
+    }
+  }
+  devs.sort((a, b) => Math.abs(b.z) - Math.abs(a.z));
+  return devs;
+}
+
 /* ──────────────────────────── Poses ─────────────────────────────── */
 
 const POSES = [
   {
     category: 'Standing', id: 'STA-01', name: 'Tadasana (Mountain Pose)',
     steps: [
-      "Stand 2 feet apart.",
+      "Stand erect with feet grounded, raise both arms straight above your head, interlock your fingers, and turn your palms upward toward the ceiling.",
       "Inhale, lift your arm to shoulder level in front.",
       "Interlock the fingers, turn the wrist outwards, inhale, raise the arms up above your head.",
       "Raise the heels off the floor and balance on the toes as you raise your arms.",
@@ -677,6 +709,16 @@ const POSES = [
       "Inhale and slowly raise both legs together towards a 90-degree angle without bending the knees.",
       "Keep the lower back pressed toward the floor and breathe normally while holding.",
       "Exhale and slowly lower the legs back down to the floor with control."
+    ]
+  },
+  {
+    category: 'Supine', id: 'SU-01-P', name: 'Pavanamukthasana (Wind-Relieving Pose)',
+    steps: [
+      "Lie flat on your back, bend both knees to your chest, and clasp your hands around your shins just below the knees.",
+      "Inhale and bend both knees, drawing the thighs gently up toward the chest.",
+      "Interlock your fingers or clasp your hands around the shins just below the knees.",
+      "Exhale, press the thighs gently against the abdomen with shoulders relaxed on the mat.",
+      "Exhale, release the hands, and slowly lower the legs back down to the floor."
     ]
   },
   {
@@ -885,7 +927,32 @@ app.post('/api/analyze-frame', async (req, res) => {
     });
 
     if (poseStepIndices.length === 0) {
-      return res.status(400).json({ error: `No trained steps found for pose "${poseName}"` });
+      const eightAngles = keyJointVisibility(landmarks) >= 0.35 ? computeEightAngles(landmarks) : null;
+      const targetAngles = getTargetAngles(poseName, eightAngles);
+      const ytCorrections = (targetAngles && eightAngles) ? getCorrections(eightAngles, targetAngles) : [];
+      const ytScore = (targetAngles && eightAngles) ? diffCompareAngle(eightAngles, targetAngles) : 0.65;
+      const isStrongMatch = ytScore >= 0.84 && ytCorrections.length === 0;
+      const isMatch = ytScore >= 0.78;
+      const feedbackText = isStrongMatch
+        ? "Looking good — hold the position! ✅"
+        : (ytCorrections.slice(0, 2).join(" ") || "Draw both knees toward your chest and clasp your hands around your shins.");
+      const analysis = {
+        stepComplete: false,
+        hasViolation: !isStrongMatch,
+        isMatch,
+        matchConfidence: ytScore,
+        feedback: feedbackText,
+        confidence: (ytScore * 100).toFixed(1) + "%",
+        ytAngleScore: (ytScore * 100).toFixed(1) + "%",
+        ytCorrections,
+        idealLandmarks: null,
+        targetAngles: targetAngles || null,
+        liveAngles: eightAngles,
+        descriptorDeviations: [],
+        ageGroup,
+      };
+      logFrame(poseName, currentStepIndex, isMatch, ytScore, feedbackText, landmarks, user);
+      return res.json({ success: true, analysis, stepText });
     }
 
     // Best-matching step among THIS pose's steps only, plus a confidence
@@ -952,9 +1019,9 @@ app.post('/api/analyze-frame', async (req, res) => {
     // to per-pose ideal targets from YogaTwin-AI.  Only run when all 8 key
     // joints are sufficiently visible.
     let ytCorrections = [];
-    const targetAngles = getTargetAngles(poseName);
-    if (targetAngles && keyJointVisibility(landmarks) >= 0.35) {
-      const eightAngles = computeEightAngles(landmarks);
+    const eightAngles = keyJointVisibility(landmarks) >= 0.35 ? computeEightAngles(landmarks) : null;
+    const targetAngles = getTargetAngles(poseName, eightAngles);
+    if (targetAngles && eightAngles) {
       ytCorrections = getCorrections(eightAngles, targetAngles);
     }
 
@@ -987,12 +1054,16 @@ app.post('/api/analyze-frame', async (req, res) => {
       confidence: (matchConfidence * 100).toFixed(1) + '%',
       ytAngleScore: ytScore !== null ? (ytScore * 100).toFixed(1) + '%' : null,
       ytCorrections,
+      idealLandmarks: idealLandmarksMap[expectedLabel]?.landmarks || null,
+      targetAngles: targetAngles || null,
+      liveAngles: keyJointVisibility(landmarks) >= 0.35 ? computeEightAngles(landmarks) : null,
+      descriptorDeviations: isStrongMatch ? [] : getDescriptorDeviations(postureDescriptors, stepReferenceStats[expectedLabel]),
     };
 
     // Log frame to frame_log.jsonl and broadcast to WebSocket clients (UE)
     logFrame(poseName, currentStepIndex, isMatch, matchConfidence, feedbackText, landmarks, user);
 
-    res.json({ success: true, analysis, stepText });
+    res.json({ success: true, analysis, stepText, ageGroup });
   } catch (error) {
     console.error('❌ Inference error:', error.message);
     res.status(500).json({ error: error.message || 'An error occurred during local inference.' });
@@ -1038,8 +1109,21 @@ app.post('/api/ollama-feedback', async (req, res) => {
         format: 'json',
       };
     } else {
+      const detectedIssues = Array.isArray(req.body.detectedErrors) && req.body.detectedErrors.length > 0
+        ? "\n\nDETECTED BIOMECHANICAL ERRORS FROM RULE ENGINE:\n- " + req.body.detectedErrors.join("\n- ")
+        : "";
+      const consultantContext = req.body.consultantCriteria
+        ? "\n\nCONSULTANT CORRECTNESS CRITERIA:\n" + req.body.consultantCriteria
+        : "";
+      const compactLandmarks = Array.isArray(landmarks) ? landmarks.slice(0, 33).map((lm, idx) => ({
+        i: idx,
+        x: Number((lm.x ?? 0).toFixed(3)),
+        y: Number((lm.y ?? 0).toFixed(3)),
+        z: Number((lm.z ?? 0).toFixed(3))
+      })) : landmarks;
       const prompt = buildStepVerificationPrompt(poseName, stepText, ageGroup) +
-        '\n\nHere are the 33 MediaPipe Landmarks for the current frame:\n' + JSON.stringify(landmarks);
+        detectedIssues + consultantContext +
+        '\n\nHere are the 33 MediaPipe Landmarks for the current frame:\n' + JSON.stringify(compactLandmarks);
       requestBody = {
         model: OLLAMA_MODEL,
         prompt,
@@ -1048,6 +1132,7 @@ app.post('/api/ollama-feedback', async (req, res) => {
       };
     }
 
+    const modelUsed = imageBase64 ? OLLAMA_VISION_MODEL : OLLAMA_MODEL;
     let ollamaRes;
     try {
       ollamaRes = await fetch(`${OLLAMA_HOST}/api/generate`, {
@@ -1056,7 +1141,6 @@ app.post('/api/ollama-feedback', async (req, res) => {
         body: JSON.stringify(requestBody),
       });
     } catch (e) {
-      const modelUsed = imageBase64 ? OLLAMA_VISION_MODEL : OLLAMA_MODEL;
       return res.status(503).json({
         error: `Could not reach local Ollama server at ${OLLAMA_HOST}. Make sure Ollama is running ` +
           `(e.g. \`ollama serve\`) and the model "${modelUsed}" is pulled (\`ollama pull ${modelUsed}\`).`
@@ -1095,7 +1179,17 @@ app.post('/api/ollama-feedback', async (req, res) => {
       }
     );
 
-    res.json({ success: true, analysis, stepText });
+    res.json({
+      success: true,
+      analysis,
+      stepText,
+      poseName,
+      ageGroup,
+      model: modelUsed,
+      sessionId: req.body.sessionId ?? null,
+      poseId: req.body.poseId ?? null,
+      requestId: req.body.requestId ?? null,
+    });
   } catch (error) {
     console.error('❌ Ollama fallback error:', error.message);
     res.status(500).json({ error: error.message });

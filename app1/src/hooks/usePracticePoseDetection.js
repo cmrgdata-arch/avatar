@@ -5,6 +5,7 @@ import {
   DrawingUtils,
 } from "@mediapipe/tasks-vision";
 import {
+  classifyLiveAsana,
   computeEightAngles,
   diffCompareAngle,
   getCorrections,
@@ -14,9 +15,7 @@ import {
 import { getTargetAnglesForPoseName } from "../data/practicePoseTargets";
 
 const WASM_BASE = "/assets/mediapipe/wasm";
-
-const MODEL_PATH =
-  "/assets/mediapipe/models/pose_landmarker_lite.task";
+const MODEL_PATH = "/assets/mediapipe/models/pose_landmarker_lite.task";
 
 const CORE_INDICES = [
   POSE_LM.LEFT_SHOULDER,
@@ -37,12 +36,15 @@ function syncCanvasToVideo(canvas, video) {
   }
   const rw = video.getBoundingClientRect().width;
   const rh = video.getBoundingClientRect().height;
-  canvas.style.width = `${rw}px`;
-  canvas.style.height = `${rh}px`;
+  const sw = `${rw}px`;
+  const sh = `${rh}px`;
+  if (canvas.style.width !== sw) canvas.style.width = sw;
+  if (canvas.style.height !== sh) canvas.style.height = sh;
 }
 
 /**
  * Loads MediaPipe PoseLandmarker, draws skeleton on canvas, updates practice context (throttled).
+ * Callbacks are stored in refs so React state updates never reinitialize PoseLandmarker.
  */
 export function usePracticePoseDetection({
   videoRef,
@@ -52,23 +54,36 @@ export function usePracticePoseDetection({
   setDetectedPose,
   setConfidence,
   setCorrections,
+  onRawLandmarks,
 }) {
   const [mediapipeError, setMediapipeError] = useState(null);
   const lastVideoTimeRef = useRef(-1);
+  const lastTimestampMsRef = useRef(0);
   const lastUiUpdateRef = useRef(0);
   const practicePoseNameRef = useRef(practicePoseName);
+  const onRawLandmarksRef = useRef(onRawLandmarks);
+  const setDetectedPoseRef = useRef(setDetectedPose);
+  const setConfidenceRef = useRef(setConfidence);
+  const setCorrectionsRef = useRef(setCorrections);
+
   practicePoseNameRef.current = practicePoseName;
+  onRawLandmarksRef.current = onRawLandmarks;
+  setDetectedPoseRef.current = setDetectedPose;
+  setConfidenceRef.current = setConfidence;
+  setCorrectionsRef.current = setCorrections;
 
   useEffect(() => {
     if (!enabled) {
       setMediapipeError(null);
-      return;
+      return undefined;
     }
 
     let cancelled = false;
     let landmarker = null;
     let rafId = 0;
     let drawingUtils = null;
+    let lastValidLandmarks = null;
+    let lastValidTs = 0;
 
     (async () => {
       try {
@@ -100,8 +115,6 @@ export function usePracticePoseDetection({
       }
 
       setMediapipeError(null);
-      const targetAngles = () =>
-        getTargetAnglesForPoseName(practicePoseNameRef.current);
 
       const loop = () => {
         if (cancelled) return;
@@ -113,7 +126,7 @@ export function usePracticePoseDetection({
           return;
         }
 
-        if (video.readyState < 2) {
+        if (video.readyState < 2 || video.videoWidth <= 0) {
           rafId = requestAnimationFrame(loop);
           return;
         }
@@ -136,10 +149,17 @@ export function usePracticePoseDetection({
         }
         lastVideoTimeRef.current = video.currentTime;
 
+        // Enforce strictly monotonic integer timestamp for MediaPipe PoseLandmarker
+        const now = performance.now();
+        const ts = Math.max(
+          lastTimestampMsRef.current + 1,
+          Math.floor(now)
+        );
+        lastTimestampMsRef.current = ts;
+
         let result;
         try {
-          result = landmarker.detectForVideo(video, performance.now());
-          console.log("Pose Result:", result);
+          result = landmarker.detectForVideo(video, ts);
         } catch {
           rafId = requestAnimationFrame(loop);
           return;
@@ -148,12 +168,19 @@ export function usePracticePoseDetection({
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
         const landmarks = result?.landmarks?.[0];
-        const now = performance.now();
+        const worldLandmarks = result?.worldLandmarks?.[0] || null;
 
         if (
           landmarks &&
           minJointVisibility(landmarks, CORE_INDICES) >= 0.35
         ) {
+          lastValidLandmarks = landmarks;
+          lastValidTs = now;
+
+          if (typeof onRawLandmarksRef.current === "function") {
+            onRawLandmarksRef.current(landmarks, worldLandmarks);
+          }
+
           drawingUtils.drawConnectors(
             landmarks,
             PoseLandmarker.POSE_CONNECTIONS,
@@ -166,28 +193,49 @@ export function usePracticePoseDetection({
           });
 
           const angles = computeEightAngles(landmarks);
-          const tAngles = targetAngles();
-          const corrections = getCorrections(angles, tAngles);
-          const aScore = diffCompareAngle(angles, tAngles);
+          const tAngles = getTargetAnglesForPoseName(
+            practicePoseNameRef.current,
+            angles
+          );
+          const corrections = tAngles ? getCorrections(angles, tAngles) : [];
+          const aScore = tAngles ? diffCompareAngle(angles, tAngles) : 0.5;
           const conf = Math.round(
             Math.max(0, Math.min(100, (1 - aScore) * 100))
           );
+          const liveClass = classifyLiveAsana(landmarks, angles);
 
           if (now - lastUiUpdateRef.current >= UI_UPDATE_MS) {
             lastUiUpdateRef.current = now;
-            setCorrections(corrections);
-            setConfidence(conf);
-            const label = practicePoseNameRef.current;
-            setDetectedPose(conf >= 48 ? label : "—");
+            setCorrectionsRef.current?.(corrections);
+            setConfidenceRef.current?.(conf);
+            setDetectedPoseRef.current?.(liveClass.detectedPose);
           }
         } else {
-          if (now - lastUiUpdateRef.current >= UI_UPDATE_MS) {
-            lastUiUpdateRef.current = now;
-            setDetectedPose("—");
-            setConfidence(0);
-            setCorrections([
-              "Step into frame so your upper body and hips are visible",
-            ]);
+          // Short 160ms anti-blink overlay persistence for single missed frame
+          if (lastValidLandmarks && now - lastValidTs <= 160) {
+            drawingUtils.drawConnectors(
+              lastValidLandmarks,
+              PoseLandmarker.POSE_CONNECTIONS,
+              { color: "#00c853", lineWidth: 4 }
+            );
+            drawingUtils.drawLandmarks(lastValidLandmarks, {
+              color: "#ff1744",
+              lineWidth: 2,
+              radius: 5,
+            });
+          } else {
+            lastValidLandmarks = null;
+            if (typeof onRawLandmarksRef.current === "function") {
+              onRawLandmarksRef.current(null, null);
+            }
+            if (now - lastUiUpdateRef.current >= UI_UPDATE_MS) {
+              lastUiUpdateRef.current = now;
+              setDetectedPoseRef.current?.("—");
+              setConfidenceRef.current?.(0);
+              setCorrectionsRef.current?.([
+                "Position your full body inside the camera frame",
+              ]);
+            }
           }
         }
 
@@ -210,7 +258,7 @@ export function usePracticePoseDetection({
         ctx?.clearRect(0, 0, canvas.width, canvas.height);
       }
     };
-  }, [enabled, videoRef, canvasRef, setDetectedPose, setConfidence, setCorrections]);
+  }, [enabled, videoRef, canvasRef]);
 
   return { mediapipeError };
 }

@@ -15,7 +15,6 @@
  *   [6] right knee    [7] left knee
  */
 
-// ── Landmark indices ─────────────────────────────────────────────────────────
 const LM = {
   LEFT_SHOULDER: 11, RIGHT_SHOULDER: 12,
   LEFT_ELBOW: 13,    RIGHT_ELBOW: 14,
@@ -25,10 +24,6 @@ const LM = {
   LEFT_ANKLE: 27,    RIGHT_ANKLE: 28,
 };
 
-/**
- * Calculate the 2-D angle (degrees, 0–180) at vertex b formed by a–b–c.
- * Mirrors calculateAngle() from YogaTwin practicePoseAnalysis.js / main6.py.
- */
 export function calculateAngle(a, b, c) {
   let radians = Math.atan2(c.y - b.y, c.x - b.x) - Math.atan2(a.y - b.y, a.x - b.x);
   let angle = Math.abs((radians * 180) / Math.PI);
@@ -36,11 +31,6 @@ export function calculateAngle(a, b, c) {
   return Math.round(angle);
 }
 
-/**
- * Compute the 8 canonical joint angles from raw MediaPipe landmark array.
- * Returns [rightElbow, leftElbow, rightShoulder, leftShoulder,
- *          rightHip, leftHip, rightKnee, leftKnee] in degrees.
- */
 export function computeEightAngles(landmarks) {
   const p = i => landmarks[i];
   return [
@@ -55,10 +45,6 @@ export function computeEightAngles(landmarks) {
   ];
 }
 
-/**
- * Similarity score [0, 1] between user angles and target angles.
- * Mirrors diffCompareAngle() from YogaTwin.
- */
 export function diffCompareAngle(user, target) {
   const diffs = user.map((u, i) => {
     const mid = (u + target[i]) / 2;
@@ -68,11 +54,6 @@ export function diffCompareAngle(user, target) {
   return Math.max(0, Math.min(1, 1 - avg));
 }
 
-/**
- * Generate specific corrective instructions by comparing user angles to target.
- * Tolerance is 15° (mirrors YogaTwin ANGLE_TOL).
- * Returns array of short instruction strings (may be empty if pose is correct).
- */
 const TOL = 15;
 export function getCorrections(user, target) {
   const u = user, t = target;
@@ -96,79 +77,62 @@ export function getCorrections(user, target) {
   return out;
 }
 
-// ── Target angles per pose ────────────────────────────────────────────────────
-// Format: [rightElbow, leftElbow, rightShoulder, leftShoulder,
-//          rightHip, leftHip, rightKnee, leftKnee] degrees
-// Sources: YogaTwin-AI practicePoseTargets.js (Mountain, Tree, Triangle, Cobra)
-//          + derived targets for the remaining Common Yoga Protocol poses.
-
 export const POSE_TARGET_ANGLES = {
   // ── Standing ──────────────────────────────────────────────────────────────
+  // Consultant-approved Tadasana: both feet grounded, arms raised overhead, fingers interlocked, palms facing upward
   'Tadasana (Mountain Pose)':
+    [175, 175, 175, 175, 175, 175, 175, 175],
+
+  'Tadasana (Mountain Pose)_Overhead':
     [175, 175, 175, 175, 175, 175, 175, 175],
 
   'Vrkasana (Tree Pose)':
     [165, 170, 160, 175, 110, 175, 165, 175],
 
-  // Pada-hastasana: arms extended overhead on the way up, deep forward fold
   'Pada-hastasana (Hand-to-Foot Pose)':
     [175, 175, 165, 165, 80, 80, 170, 170],
 
-  // Ardha Cakrasana: backbend — arms overhead, spine arched, knees straight
   'Ardha Cakrasana (Half-Wheel Pose)':
     [160, 160, 60, 60, 165, 165, 175, 175],
 
-  // Ardha Katichakrasana: lateral side-bend, one arm overhead
   'Ardha Katichakrasana (Half Waist-Wheel Pose)':
     [175, 50, 165, 90, 175, 175, 175, 175],
 
-  // Trikonasana: arms to shoulder level, body bent to one side, knees straight
   'Trikonasana (Triangle Pose)':
-    [170, 100, 120, 120, 100, 170, 165, 165],
+    [170, 170, 120, 120, 100, 170, 165, 165],
 
-  // Parivritta Trikonasana: revolved — similar geometry, opposite arm down
   'Parivritta Trikonasana (Revolved Triangle Pose)':
     [100, 170, 120, 120, 170, 100, 165, 165],
 
   // ── Sitting ───────────────────────────────────────────────────────────────
-  // Ardha Ustrasana: kneeling backbend — hands on hips, chest lifted
   'Ardha Ustrasana (Half Camel Pose)':
     [160, 160, 55, 55, 145, 145, 90, 90],
 
-  // Vakrasana: seated twist — one knee bent, torso rotated
   'Vakrasana (Twisted Pose)':
     [160, 160, 130, 90, 90, 170, 130, 150],
 
   // ── Prone ─────────────────────────────────────────────────────────────────
-  // Makarasana: prone rest — arms folded, legs relaxed
   'Makarasana (Crocodile Pose)':
     [110, 110, 90, 90, 175, 175, 175, 175],
 
-  // Bhujangasana: cobra — arms pressing up, hips down, legs straight
   'Bhujangasana (Cobra Pose)':
     [165, 165, 55, 55, 140, 140, 165, 165],
 
   // ── Supine ────────────────────────────────────────────────────────────────
-  // Ardha Halasana: legs raised to 90°, arms flat, knees straight
   'Ardha Halasana (Half Plough Pose)':
     [175, 175, 135, 135, 90, 90, 175, 175],
 
-  // Savasana: completely flat and relaxed
+  'Pavanamukthasana (Wind-Relieving Pose)':
+    [130, 130, 45, 45, 75, 75, 65, 65],
+
   'Savasana (Corpse Pose)':
-    [175, 175, 175, 175, 175, 175, 175, 175],
+    [175, 175, 25, 25, 175, 175, 175, 175],
 };
 
-/**
- * Returns the 8-angle target for a pose name, or null if not in the table.
- */
 export function getTargetAngles(poseName) {
   return POSE_TARGET_ANGLES[poseName] ?? null;
 }
 
-/**
- * Minimum visibility of the 8 key joints used in angle computation.
- * Returns a value in [0, 1]; landmarks below ~0.35 should be skipped.
- */
 export function keyJointVisibility(landmarks) {
   const indices = [
     LM.LEFT_SHOULDER, LM.RIGHT_SHOULDER,

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { initMediaPipe } from "../utils/mediapipeSetup";
 import {
+  classifyLiveAsana,
   computeEightAngles,
   diffCompareAngle,
   getCorrections,
@@ -30,6 +31,7 @@ function namedLandmarksToArray(landmarks) {
 
 /**
  * Yoga Practice (/app) pose pipeline — same MediaPipe init as Data Collection (mediapipeSetup.js).
+ * Note: Callbacks are stored in refs so state updates never tear down or reinitialize MediaPipe.
  */
 export function useAppCollectionPose({
   videoRef,
@@ -45,9 +47,16 @@ export function useAppCollectionPose({
   const cleanupRef = useRef(null);
   const poseNameRef = useRef(practicePoseName);
   const onRawRef = useRef(onRawLandmarks);
+  const setDetectedPoseRef = useRef(setDetectedPose);
+  const setConfidenceRef = useRef(setConfidence);
+  const setCorrectionsRef = useRef(setCorrections);
   const lastUiRef = useRef(0);
+
   poseNameRef.current = practicePoseName;
   onRawRef.current = onRawLandmarks;
+  setDetectedPoseRef.current = setDetectedPose;
+  setConfidenceRef.current = setConfidence;
+  setCorrectionsRef.current = setCorrections;
 
   useEffect(() => {
     if (!enabled) {
@@ -77,7 +86,7 @@ export function useAppCollectionPose({
       video,
       canvas,
       (frameData) => {
-        const indexed = namedLandmarksToArray(frameData.landmarks);
+        const indexed = namedLandmarksToArray(frameData?.landmarks);
         const now = performance.now();
         if (now - lastUiRef.current < UI_UPDATE_MS) return;
         lastUiRef.current = now;
@@ -87,27 +96,28 @@ export function useAppCollectionPose({
           minJointVisibility(indexed, CORE_INDICES) >= 0.35
         ) {
           const angles = computeEightAngles(indexed);
-          const target = getTargetAnglesForPoseName(poseNameRef.current);
-          const corrections = getCorrections(angles, target);
-          const aScore = diffCompareAngle(angles, target);
+          const target = getTargetAnglesForPoseName(poseNameRef.current, angles);
+          const corrections = target ? getCorrections(angles, target) : [];
+          const aScore = target ? diffCompareAngle(angles, target) : 0.5;
           const conf = Math.round(
             Math.max(0, Math.min(100, (1 - aScore) * 100))
           );
-          setCorrections(corrections);
-          setConfidence(conf);
-          setDetectedPose(conf >= 48 ? poseNameRef.current : "—");
+          const liveClass = classifyLiveAsana(indexed, angles);
+          setCorrectionsRef.current?.(corrections);
+          setConfidenceRef.current?.(conf);
+          setDetectedPoseRef.current?.(liveClass.detectedPose);
         } else {
-          setDetectedPose("—");
-          setConfidence(0);
-          setCorrections([
-            "Step into frame so your upper body and hips are visible",
+          setDetectedPoseRef.current?.("—");
+          setConfidenceRef.current?.(0);
+          setCorrectionsRef.current?.([
+            "Position your full body inside the camera frame",
           ]);
         }
       },
       tZero,
-      (rawLandmarks) => {
+      (rawLandmarks, rawWorldLandmarks) => {
         if (typeof onRawRef.current === "function") {
-          onRawRef.current(rawLandmarks);
+          onRawRef.current(rawLandmarks, rawWorldLandmarks);
         }
       }
     );
@@ -118,14 +128,7 @@ export function useAppCollectionPose({
         cleanupRef.current = null;
       }
     };
-  }, [
-    enabled,
-    videoRef,
-    canvasRef,
-    setDetectedPose,
-    setConfidence,
-    setCorrections,
-  ]);
+  }, [enabled, videoRef, canvasRef]);
 
   return { mediapipeError };
 }

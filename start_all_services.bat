@@ -20,8 +20,8 @@ echo [3/6] Launching Main Backend Server (Port 3001)...
 start "3. Main Backend (Port 3001)" cmd /k "cd /d "%ROOT%\server" && node index.js"
 timeout /t 1 /nobreak >nul
 
-echo [4/6] Launching ML Corrective Feedback Engine in WSL (Port 3002/3000)...
-start "4. Corrective Feedback Engine (WSL)" cmd /k "wsl --cd "%ROOT%\correction-engine" node server.js"
+echo [4/6] Launching ML Corrective Feedback Engine (Port 3000)...
+start "4. Corrective Feedback Engine (Port 3000)" cmd /k "cd /d "%ROOT%\correction-engine" && set PORT=3000&& node server.js"
 timeout /t 1 /nobreak >nul
 
 echo [5/6] Launching Python Backend (Port 5000)...
@@ -38,7 +38,7 @@ echo.
 echo   [1] DL Pose API               : http://127.0.0.1:5005
 echo   [2] ML LightGBM API           : http://127.0.0.1:5006
 echo   [3] Main Backend API          : http://localhost:3001
-echo   [4] Corrective Engine (WSL)   : http://localhost:3002 / 3000
+echo   [4] Corrective Engine         : http://localhost:3000
 echo   [5] Python Backend            : http://localhost:5000
 echo   [6] Frontend Web Interface    : http://localhost:5173
 echo ======================================================================

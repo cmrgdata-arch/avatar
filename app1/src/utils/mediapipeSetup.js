@@ -9,6 +9,42 @@
  * the same visible sub-rectangle as the video, then scale by devicePixelRatio.
  */
 
+const LANDMARK_NAMES = [
+  "nose",
+  "left_eye_inner",
+  "left_eye",
+  "left_eye_outer",
+  "right_eye_inner",
+  "right_eye",
+  "right_eye_outer",
+  "left_ear",
+  "right_ear",
+  "mouth_left",
+  "mouth_right",
+  "left_shoulder",
+  "right_shoulder",
+  "left_elbow",
+  "right_elbow",
+  "left_wrist",
+  "right_wrist",
+  "left_pinky",
+  "right_pinky",
+  "left_index",
+  "right_index",
+  "left_thumb",
+  "right_thumb",
+  "left_hip",
+  "right_hip",
+  "left_knee",
+  "right_knee",
+  "left_ankle",
+  "right_ankle",
+  "left_heel",
+  "right_heel",
+  "left_foot_index",
+  "right_foot_index",
+];
+
 /**
  * Visible rect of the video bitmap inside the element when object-fit is `cover`
  * (same math as CSS).
@@ -41,6 +77,7 @@ function drawNormalizedLandmarksAsDots(
   const { color, radius = 4 } = options || {};
   ctx.fillStyle = color || "#FF0000";
   for (const lm of landmarks) {
+    if (!lm || (lm.visibility != null && lm.visibility < 0.25)) continue;
     ctx.beginPath();
     ctx.arc(mapX(lm), mapY(lm), radius, 0, 2 * Math.PI);
     ctx.fill();
@@ -68,6 +105,7 @@ function drawNormalizedConnections(
     const a = landmarks[startIdx];
     const b = landmarks[endIdx];
     if (!a || !b) continue;
+    if ((a.visibility ?? 1) < 0.25 || (b.visibility ?? 1) < 0.25) continue;
     ctx.moveTo(mapX(a), mapY(a));
     ctx.lineTo(mapX(b), mapY(b));
   }
@@ -112,10 +150,13 @@ export function initMediaPipe(
   let frameCount = 0;
   let isRunning = true;
   let rafId = 0;
+  let inFlight = false;
+  let lastVideoTime = -1;
+  let lastValidOverlayLandmarks = null;
+  let lastValidOverlayTs = 0;
 
   pose.onResults((results) => {
     if (!isRunning) return;
-
     if (!videoElement.videoWidth) return;
 
     const rect = videoElement.getBoundingClientRect();
@@ -131,31 +172,34 @@ export function initMediaPipe(
 
     const dpr =
       typeof window !== "undefined"
-        ? Math.min(window.devicePixelRatio || 1, 3)
+        ? Math.min(window.devicePixelRatio || 1, 2)
         : 1;
 
     const bufW = Math.max(1, Math.round(cssW * dpr));
     const bufH = Math.max(1, Math.round(cssH * dpr));
 
-    canvasElement.width = bufW;
-    canvasElement.height = bufH;
-
-    canvasElement.style.width = cssW + "px";
-    canvasElement.style.height = cssH + "px";
+    // Only resize backing store when dimensions actually change (prevents GPU flicker)
+    if (canvasElement.width !== bufW || canvasElement.height !== bufH) {
+      canvasElement.width = bufW;
+      canvasElement.height = bufH;
+      canvasElement.style.width = cssW + "px";
+      canvasElement.style.height = cssH + "px";
+    }
 
     canvasCtx.save();
-
     canvasCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
     canvasCtx.clearRect(0, 0, cssW, cssH);
 
     const mapX = (lm) => offsetX + lm.x * displayedWidth;
     const mapY = (lm) => offsetY + lm.y * displayedHeight;
+    const nowMs = performance.now();
 
-    if (results.poseLandmarks) {
-      // Live Data Bridge: Send raw landmarks if callback provided
+    if (results.poseLandmarks && results.poseLandmarks.length >= 33) {
+      lastValidOverlayLandmarks = results.poseLandmarks;
+      lastValidOverlayTs = nowMs;
+
       if (typeof onRawResults === "function") {
-        onRawResults(results.poseLandmarks);
+        onRawResults(results.poseLandmarks, results.poseWorldLandmarks || null);
       }
 
       drawNormalizedConnections(
@@ -181,42 +225,6 @@ export function initMediaPipe(
         }
       );
 
-      const LANDMARK_NAMES = [
-        "nose",
-        "left_eye_inner",
-        "left_eye",
-        "left_eye_outer",
-        "right_eye_inner",
-        "right_eye",
-        "right_eye_outer",
-        "left_ear",
-        "right_ear",
-        "mouth_left",
-        "mouth_right",
-        "left_shoulder",
-        "right_shoulder",
-        "left_elbow",
-        "right_elbow",
-        "left_wrist",
-        "right_wrist",
-        "left_pinky",
-        "right_pinky",
-        "left_index",
-        "right_index",
-        "left_thumb",
-        "right_thumb",
-        "left_hip",
-        "right_hip",
-        "left_knee",
-        "right_knee",
-        "left_ankle",
-        "right_ankle",
-        "left_heel",
-        "right_heel",
-        "left_foot_index",
-        "right_foot_index",
-      ];
-
       const namedLandmarks = results.poseLandmarks.map((lm, i) => ({
         name: LANDMARK_NAMES[i] ?? `joint_${i}`,
         x: parseFloat(lm.x.toFixed(6)),
@@ -228,26 +236,56 @@ export function initMediaPipe(
             : null,
       }));
 
-      onLandmarks({
-        frame: frameCount,
-        relative_timestamp: Date.now() - tZero,
-        landmarks: namedLandmarks,
-      });
+      if (typeof onLandmarks === "function") {
+        onLandmarks({
+          frame: frameCount,
+          relative_timestamp: Date.now() - tZero,
+          landmarks: namedLandmarks,
+        });
+      }
 
       frameCount++;
-    }
-
-    if (results.faceLandmarks?.length) {
-      drawNormalizedLandmarksAsDots(
-        canvasCtx,
-        results.faceLandmarks,
-        mapX,
-        mapY,
-        {
-          color: "#00B0FF",
-          radius: 1.5,
+    } else {
+      // Short 160ms anti-blink overlay persistence for single missed frames,
+      // while immediately notifying downstream when tracking drops beyond 160ms
+      if (
+        lastValidOverlayLandmarks &&
+        nowMs - lastValidOverlayTs <= 160
+      ) {
+        drawNormalizedConnections(
+          canvasCtx,
+          lastValidOverlayLandmarks,
+          window.POSE_CONNECTIONS,
+          mapX,
+          mapY,
+          {
+            color: "#00FF00",
+            lineWidth: 3,
+          }
+        );
+        drawNormalizedLandmarksAsDots(
+          canvasCtx,
+          lastValidOverlayLandmarks,
+          mapX,
+          mapY,
+          {
+            color: "#FF0000",
+            radius: 4,
+          }
+        );
+      } else {
+        lastValidOverlayLandmarks = null;
+        if (typeof onRawResults === "function") {
+          onRawResults(null, null);
         }
-      );
+        if (typeof onLandmarks === "function") {
+          onLandmarks({
+            frame: frameCount,
+            relative_timestamp: Date.now() - tZero,
+            landmarks: null,
+          });
+        }
+      }
     }
 
     canvasCtx.restore();
@@ -255,14 +293,25 @@ export function initMediaPipe(
 
   const tick = async () => {
     if (!isRunning) return;
-    if (videoElement.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+    if (
+      !inFlight &&
+      videoElement.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+      videoElement.videoWidth > 0 &&
+      videoElement.currentTime !== lastVideoTime
+    ) {
+      inFlight = true;
+      lastVideoTime = videoElement.currentTime;
       try {
         await pose.send({ image: videoElement });
       } catch (_) {
         /* ignore single-frame failures */
+      } finally {
+        inFlight = false;
       }
     }
-    rafId = requestAnimationFrame(tick);
+    if (isRunning) {
+      rafId = requestAnimationFrame(tick);
+    }
   };
 
   rafId = requestAnimationFrame(tick);
@@ -270,7 +319,11 @@ export function initMediaPipe(
   return function cleanup() {
     isRunning = false;
     cancelAnimationFrame(rafId);
-    pose.close();
+    try {
+      pose.close();
+    } catch (_) {
+      /* noop */
+    }
     try {
       canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
     } catch (_) {

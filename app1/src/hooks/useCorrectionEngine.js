@@ -1,271 +1,542 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCorrectionPoseName } from "../data/correctionPoseMap";
+import { getAsanaReferenceByNameOrId } from "../data/asanaReferenceTable";
 
 /**
- * Base URL for the Yoga Pose Correction engine.
- * In dev this defaults to "/correction-api", which the Vite proxy
- * (see app1/vite.config.js) forwards to the engine's "/api" namespace.
- * Override for production with VITE_CORRECTION_API_BASE.
+ * Throttled polling hook that bridges live MediaPipe landmarks from the
+ * practice view into the Yoga Pose Correction engine (`POST /correction-api/analyze-frame`)
+ * AND triggers the local Ollama LLM coach (`POST /correction-api/ollama-feedback`)
+ * when the user remains stuck in a posture violation for >= 3000 ms during active recording.
+ *
+ * Strictly preserves:
+ * - 500 ms rule-engine polling cadence
+ * - 6-frame rolling window (require >= 4 matches at >= 60% confidence for GOOD_FORM)
+ * - 3-frame feedback text debounce
+ * - 3000 ms stuck-user violation threshold + 10000 ms cooldown before invoking Ollama
+ * - Strict sessionId / poseId / poseName / requestId validation so stale Ollama responses
+ *   are discarded if the user switches poses, loses full-body tracking, or stops recording.
  */
-const CORRECTION_API_BASE =
-  (import.meta.env && import.meta.env.VITE_CORRECTION_API_BASE) ||
-  "/correction-api";
 
-// Throttle: minimum gap between inference requests (~3 req/s).
-const MIN_REQUEST_INTERVAL_MS = 330;
-// Abort a request if the engine takes longer than this (keeps the loop live).
-const REQUEST_TIMEOUT_MS = 2500;
-// After N consecutive failures, back off and surface an "engine offline" state.
-const MAX_CONSECUTIVE_FAILURES = 3;
-// On backoff, pause requests for this long before retrying.
-const BACKOFF_MS = 4000;
-// Rolling window of recent isMatch results used to smooth status (anti-flicker).
-const SMOOTHING_WINDOW = 5;
-// Fraction of the window that must be matches to report "Good Form".
-const GOOD_FORM_RATIO = 0.6;
-// If no fresh landmarks arrive within this long, treat the pose as not detected.
-const LANDMARK_STALE_MS = 1200;
+const POLL_INTERVAL_MS = 500;
+const WINDOW_SIZE = 6;
+const REQUIRED_MATCHES = 4;
+const MATCH_CONF_THRESHOLD = 0.6;
+const FEEDBACK_DEBOUNCE_FRAMES = 3;
+const MIN_LANDMARK_VISIBILITY = 0.35;
 
-/** Possible UI statuses. */
+// Existing stuck-user Ollama trigger threshold & cooldown
+export const OLLAMA_STUCK_TRIGGER_MS = 3000;
+export const OLLAMA_COOLDOWN_MS = 10000;
+export const OLLAMA_FEEDBACK_HOLD_MS = 6500;
+
 export const CORRECTION_STATUS = {
   IDLE: "idle",
-  DETECTING: "detecting", // landmarks seen, awaiting/averaging engine results
+  DETECTING: "detecting",
   GOOD_FORM: "good_form",
   ADJUST: "adjust",
-  NOT_DETECTED: "not_detected", // no/insufficient landmarks
-  UNAVAILABLE: "unavailable", // pose not supported by the engine
-  ERROR: "error", // engine offline / repeated failures
+  NOT_DETECTED: "not_detected",
+  UNAVAILABLE: "unavailable",
+  ERROR: "error",
+};
+
+const KEY_JOINTS = [11, 12, 13, 14, 23, 24, 25, 26]; // L/R shoulders, elbows, hips, knees
+
+function areKeyJointsVisible(landmarks) {
+  if (!Array.isArray(landmarks) || landmarks.length < 33) return false;
+  for (const idx of KEY_JOINTS) {
+    const lm = landmarks[idx];
+    if (!lm || (lm.visibility ?? 0) < MIN_LANDMARK_VISIBILITY) return false;
+  }
+  return true;
+}
+
+export function classifyUserAgeGroup(age) {
+  const a = parseInt(age, 10);
+  if (!Number.isFinite(a) || a <= 0) return null;
+  return a < 40 ? "under40" : "40plus";
+}
+
+const INITIAL_OLLAMA_STATE = {
+  active: false,
+  loading: false,
+  feedback: null,
+  stepComplete: false,
+  poseId: null,
+  poseName: null,
+  correctionPoseName: null,
+  sessionId: null,
+  requestId: 0,
+  ageGroup: null,
+  model: null,
+  timestamp: null,
 };
 
 /**
- * Real-time correction loop. Reuses landmarks produced by the EXISTING
- * MediaPipe pipeline (no second detection loop): the caller feeds raw
- * MediaPipe landmarks via the returned `pushLandmarks` callback. The hook
- * throttles and serializes POST /analyze-frame calls to the correction engine
- * and exposes smoothed, actionable results for the practice screen.
- *
  * @param {object} opts
- * @param {boolean} opts.active - whether the correction loop should run
- * @param {string}  opts.appPoseName - current pose name from src/data/poses.js
- * @param {number}  opts.currentStepIndex - current step index (default 0)
- * @param {number|string} [opts.age] - optional user age (age-aware coaching)
- * @param {string} [opts.userName] - optional user name
+ * @param {boolean} opts.active - Whether the practice session is actively running (`isRecording && isFullBodyDetected && isTrackingStable`)
+ * @param {string} opts.appPoseName - Pose `name` from `src/data/poses.js` (e.g. "Mountain Pose")
+ * @param {string} [opts.poseId] - Pose `id` from `src/data/poses.js` (e.g. "STA-01")
+ * @param {string|number} [opts.sessionId] - Current practice session ID
+ * @param {string} [opts.trackingState] - Current tracking state from `useSessionTrackingState`
+ * @param {number} [opts.currentStepIndex=0] - Step index within the pose sequence
+ * @param {number|null} [opts.age=null] - User age (used for <40 vs 40+ coaching guidance)
+ * @param {string|null} [opts.userName=null] - User identifier for server-side logs
  */
 export function useCorrectionEngine({
   active,
   appPoseName,
+  poseId = null,
+  sessionId = null,
+  trackingState = null,
   currentStepIndex = 0,
-  age,
-  userName,
+  age = null,
+  userName = null,
 }) {
-  const correctionPoseName = useMemo(
-    () => getCorrectionPoseName(appPoseName),
-    [appPoseName]
-  );
+  const correctionPoseName = getCorrectionPoseName(appPoseName);
   const supported = Boolean(correctionPoseName);
+  const asanaReference = useMemo(
+    () => getAsanaReferenceByNameOrId(poseId || appPoseName),
+    [poseId, appPoseName]
+  );
+  const ageGroup = useMemo(() => classifyUserAgeGroup(age), [age]);
 
-  const [status, setStatus] = useState(CORRECTION_STATUS.IDLE);
-  const [matchConfidence, setMatchConfidence] = useState(null); // 0..1 or null
-  const [feedback, setFeedback] = useState("");
-  const [corrections, setCorrections] = useState([]); // string[]
-  const [stepText, setStepText] = useState("");
-  const [engineOnline, setEngineOnline] = useState(true);
-
-  // Mutable refs for the hot loop (avoid re-subscribing on every value change).
   const latestLandmarksRef = useRef(null);
-  const latestLandmarkTsRef = useRef(0);
   const inFlightRef = useRef(false);
-  const lastRequestTsRef = useRef(0);
-  const failureCountRef = useRef(0);
-  const backoffUntilRef = useRef(0);
   const matchWindowRef = useRef([]);
-  const abortRef = useRef(null);
-  const paramsRef = useRef({ correctionPoseName, currentStepIndex, age, userName });
-  paramsRef.current = { correctionPoseName, currentStepIndex, age, userName };
+  const pendingFeedbackRef = useRef({ text: "", count: 0 });
+  const shownFeedbackRef = useRef("");
 
-  /** Caller pushes raw MediaPipe landmarks (array of {x,y,z,visibility}). */
-  const pushLandmarks = useCallback((rawLandmarks) => {
-    if (Array.isArray(rawLandmarks) && rawLandmarks.length === 33) {
-      latestLandmarksRef.current = rawLandmarks;
-      latestLandmarkTsRef.current = performance.now();
-    }
+  // Stuck-user Ollama timer & request tracking refs
+  const violationStartTimeRef = useRef(null);
+  const lastOllamaRequestTimeRef = useRef(0);
+  const isRequestingOllamaRef = useRef(false);
+  const ollamaHoldUntilRef = useRef(0);
+  const ollamaRequestSeqRef = useRef(0);
+  const ollamaAbortRef = useRef(null);
+  const latestDetectedErrorsRef = useRef([]);
+  const activeRef = useRef(active);
+  const appPoseNameRef = useRef(appPoseName);
+  const poseIdRef = useRef(poseId);
+  const sessionIdRef = useRef(sessionId);
+
+  activeRef.current = active;
+  appPoseNameRef.current = appPoseName;
+  poseIdRef.current = poseId;
+  sessionIdRef.current = sessionId;
+
+  const [state, setState] = useState({
+    status: supported ? CORRECTION_STATUS.IDLE : CORRECTION_STATUS.UNAVAILABLE,
+    engineOnline: true,
+    matchConfidence: null,
+    feedback: null,
+    corrections: [],
+    stepText: null,
+    idealLandmarks: null,
+    targetAngles: null,
+    liveAngles: null,
+    descriptorDeviations: [],
+    ytAngleScore: null,
+  });
+
+  const [ollamaCoaching, setOllamaCoaching] = useState(INITIAL_OLLAMA_STATE);
+
+  /** Called by the MediaPipe frame loop with the latest 33 landmarks. */
+  const pushLandmarks = useCallback((landmarks) => {
+    latestLandmarksRef.current = landmarks;
   }, []);
 
-  const pushStatusFromWindow = useCallback(() => {
-    const win = matchWindowRef.current;
-    if (win.length === 0) {
-      setStatus(CORRECTION_STATUS.DETECTING);
-      return;
-    }
-    const matches = win.filter(Boolean).length;
-    const ratio = matches / win.length;
-    setStatus(
-      ratio >= GOOD_FORM_RATIO
-        ? CORRECTION_STATUS.GOOD_FORM
-        : CORRECTION_STATUS.ADJUST
-    );
-  }, []);
-
-  // Reset transient state when pose/step changes or loop toggles.
+  // Reset rolling state and abort any pending Ollama request when pose, step, or `active` changes
   useEffect(() => {
     matchWindowRef.current = [];
-    failureCountRef.current = 0;
-    backoffUntilRef.current = 0;
-    setMatchConfidence(null);
-    setFeedback("");
-    setCorrections([]);
-    setStepText("");
-  }, [appPoseName, currentStepIndex, active]);
+    pendingFeedbackRef.current = { text: "", count: 0 };
+    shownFeedbackRef.current = "";
+    latestLandmarksRef.current = null;
+    violationStartTimeRef.current = null;
+    isRequestingOllamaRef.current = false;
+    ollamaHoldUntilRef.current = 0;
+    latestDetectedErrorsRef.current = [];
+    ollamaRequestSeqRef.current += 1;
+
+    if (ollamaAbortRef.current) {
+      ollamaAbortRef.current.abort();
+      ollamaAbortRef.current = null;
+    }
+
+    setOllamaCoaching(INITIAL_OLLAMA_STATE);
+
+    if (!supported) {
+      setState((prev) => ({
+        ...prev,
+        status: CORRECTION_STATUS.UNAVAILABLE,
+        matchConfidence: null,
+        feedback: null,
+        corrections: [],
+        stepText: null,
+        idealLandmarks: null,
+        targetAngles: null,
+        liveAngles: null,
+        descriptorDeviations: [],
+        ytAngleScore: null,
+      }));
+    } else if (!active) {
+      setState((prev) => ({
+        ...prev,
+        status: CORRECTION_STATUS.IDLE,
+        matchConfidence: null,
+        feedback: null,
+        corrections: [],
+        stepText: null,
+        idealLandmarks: null,
+        targetAngles: null,
+        liveAngles: null,
+        descriptorDeviations: [],
+        ytAngleScore: null,
+      }));
+    } else {
+      setState((prev) => ({
+        ...prev,
+        status: CORRECTION_STATUS.DETECTING,
+        matchConfidence: null,
+        feedback: null,
+        corrections: [],
+      }));
+    }
+  }, [active, correctionPoseName, currentStepIndex, supported, appPoseName, poseId]);
 
   useEffect(() => {
-    if (!active) {
-      setStatus(CORRECTION_STATUS.IDLE);
-      return undefined;
-    }
-    if (!supported) {
-      setStatus(CORRECTION_STATUS.UNAVAILABLE);
-      return undefined;
-    }
+    if (!active || !supported) return undefined;
 
     let stopped = false;
-    let timer = 0;
+
+    const triggerOllamaStuckCoaching = async (lm, detectedErrorsSnapshot) => {
+      const now = Date.now();
+      if (
+        stopped ||
+        !activeRef.current ||
+        isRequestingOllamaRef.current ||
+        now - lastOllamaRequestTimeRef.current < OLLAMA_COOLDOWN_MS
+      ) {
+        return;
+      }
+
+      isRequestingOllamaRef.current = true;
+      const reqId = ++ollamaRequestSeqRef.current;
+      const reqPoseName = appPoseNameRef.current;
+      const reqPoseId = poseIdRef.current || asanaReference?.id || null;
+      const reqSessionId = sessionIdRef.current || null;
+
+      if (ollamaAbortRef.current) {
+        ollamaAbortRef.current.abort();
+      }
+      const abortController = new AbortController();
+      ollamaAbortRef.current = abortController;
+
+      setOllamaCoaching((prev) => ({
+        ...prev,
+        loading: true,
+        poseId: reqPoseId,
+        poseName: reqPoseName,
+        correctionPoseName,
+        sessionId: reqSessionId,
+        requestId: reqId,
+      }));
+
+      try {
+        const consultantCriteria = asanaReference
+          ? [
+              `Final Posture: ${asanaReference.finalPosture}`,
+              `Correctness Criteria: ${asanaReference.correctnessCriteria.join(" | ")}`,
+              ageGroup === "40plus" && asanaReference.correctionCues?.over40?.length
+                ? `Age 40+ Guidance: ${asanaReference.correctionCues.over40.join(" ")}`
+                : asanaReference.correctionCues?.under40?.length
+                ? `Under-40 Guidance: ${asanaReference.correctionCues.under40.join(" ")}`
+                : "",
+            ]
+              .filter(Boolean)
+              .join("\n")
+          : undefined;
+
+        const res = await fetch("/correction-api/ollama-feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: abortController.signal,
+          body: JSON.stringify({
+            poseName: correctionPoseName,
+            appPoseName: reqPoseName,
+            poseId: reqPoseId,
+            sessionId: reqSessionId,
+            trackingState: trackingState || "RECORDING_AND_TRACKING",
+            requestId: reqId,
+            currentStepIndex,
+            landmarks: lm,
+            age,
+            userName,
+            detectedErrors: detectedErrorsSnapshot,
+            consultantCriteria,
+          }),
+        });
+
+        // Validate that session, pose, recording state, and requestId are still current
+        if (
+          stopped ||
+          !activeRef.current ||
+          reqId !== ollamaRequestSeqRef.current ||
+          appPoseNameRef.current !== reqPoseName
+        ) {
+          return;
+        }
+
+        if (!res.ok) {
+          setOllamaCoaching((prev) => ({ ...prev, loading: false }));
+          return;
+        }
+
+        const data = await res.json();
+        if (
+          stopped ||
+          !activeRef.current ||
+          reqId !== ollamaRequestSeqRef.current ||
+          appPoseNameRef.current !== reqPoseName ||
+          !data?.success ||
+          !data?.analysis?.feedback
+        ) {
+          setOllamaCoaching((prev) => ({ ...prev, loading: false }));
+          return;
+        }
+
+        const coachTip = String(data.analysis.feedback).trim();
+        lastOllamaRequestTimeRef.current = Date.now();
+        ollamaHoldUntilRef.current = Date.now() + OLLAMA_FEEDBACK_HOLD_MS;
+        shownFeedbackRef.current = coachTip;
+
+        setOllamaCoaching({
+          active: true,
+          loading: false,
+          feedback: coachTip,
+          stepComplete: Boolean(data.analysis.stepComplete),
+          poseId: data.poseId || reqPoseId,
+          poseName: reqPoseName,
+          correctionPoseName,
+          sessionId: data.sessionId || reqSessionId,
+          requestId: reqId,
+          ageGroup: data.ageGroup || ageGroup,
+          model: data.model || "llama3.2",
+          timestamp: Date.now(),
+        });
+
+        setState((prev) => ({
+          ...prev,
+          feedback: coachTip,
+          corrections:
+            prev.corrections && prev.corrections.length > 0
+              ? [coachTip, ...prev.corrections.filter((c) => c !== coachTip)].slice(0, 4)
+              : [coachTip],
+        }));
+      } catch (err) {
+        if (err?.name !== "AbortError" && !stopped) {
+          setOllamaCoaching((prev) => ({ ...prev, loading: false }));
+        }
+      } finally {
+        isRequestingOllamaRef.current = false;
+      }
+    };
 
     const tick = async () => {
-      if (stopped) return;
+      if (stopped || inFlightRef.current) return;
 
-      const now = performance.now();
-
-      // Pause work when the tab is hidden to save battery/CPU.
-      if (typeof document !== "undefined" && document.hidden) {
-        schedule(300);
-        return;
-      }
-
-      // Respect backoff window after repeated failures.
-      if (now < backoffUntilRef.current) {
-        schedule(backoffUntilRef.current - now);
-        return;
-      }
-
-      // Stale / missing landmarks → not detected (but keep polling).
-      const landmarks = latestLandmarksRef.current;
-      const landmarkAge = now - latestLandmarkTsRef.current;
-      if (!landmarks || landmarkAge > LANDMARK_STALE_MS) {
-        setStatus(CORRECTION_STATUS.NOT_DETECTED);
-        schedule(200);
-        return;
-      }
-
-      // Throttle + prevent overlapping requests.
-      if (inFlightRef.current || now - lastRequestTsRef.current < MIN_REQUEST_INTERVAL_MS) {
-        schedule(60);
+      const lm = latestLandmarksRef.current;
+      if (!lm || !areKeyJointsVisible(lm)) {
+        matchWindowRef.current = [];
+        violationStartTimeRef.current = null;
+        setState((prev) => ({
+          ...prev,
+          status: CORRECTION_STATUS.NOT_DETECTED,
+          matchConfidence: null,
+          feedback:
+            "Step into frame so your shoulders, hips, and knees are clearly visible.",
+          corrections: [],
+        }));
         return;
       }
 
       inFlightRef.current = true;
-      lastRequestTsRef.current = now;
-
-      const { correctionPoseName: pose, currentStepIndex: step, age: a, userName: u } =
-        paramsRef.current;
-
-      const controller = new AbortController();
-      abortRef.current = controller;
-      const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
       try {
-        const res = await fetch(`${CORRECTION_API_BASE}/analyze-frame`, {
+        const res = await fetch("/correction-api/analyze-frame", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          signal: controller.signal,
           body: JSON.stringify({
-            poseName: pose,
-            currentStepIndex: step,
-            landmarks: landmarks.map((lm) => ({
-              x: lm.x,
-              y: lm.y,
-              z: lm.z ?? 0,
-              visibility: lm.visibility ?? 0,
-            })),
-            ...(a != null && a !== "" ? { age: a } : {}),
-            ...(u ? { userName: u } : {}),
+            poseName: correctionPoseName,
+            currentStepIndex,
+            landmarks: lm,
+            age,
+            userName,
           }),
         });
 
+        if (stopped) return;
+
         if (!res.ok) {
-          // 503 (model untrained) or 400 (bad input) — surface, don't crash.
-          throw new Error(`engine ${res.status}`);
+          setState((prev) => ({
+            ...prev,
+            status: CORRECTION_STATUS.ERROR,
+            engineOnline: false,
+          }));
+          return;
         }
 
         const data = await res.json();
-        const analysis = data?.analysis || {};
+        if (stopped || !data?.success) return;
 
-        // Success → reset failure tracking.
-        failureCountRef.current = 0;
-        setEngineOnline(true);
+        const {
+          isMatch,
+          matchConfidence = 0,
+          feedback = "",
+          ytCorrections = [],
+          idealLandmarks = null,
+          targetAngles = null,
+          liveAngles = null,
+          descriptorDeviations = [],
+          ytAngleScore = null,
+        } = data.analysis || {};
 
-        // Smooth the match signal across a rolling window to avoid flicker.
+        // 1. Temporal smoothing over a rolling 6-frame window
         const win = matchWindowRef.current;
-        win.push(Boolean(analysis.isMatch));
-        if (win.length > SMOOTHING_WINDOW) win.shift();
+        const frameMatched =
+          Boolean(isMatch) && matchConfidence >= MATCH_CONF_THRESHOLD;
+        win.push(frameMatched);
+        if (win.length > WINDOW_SIZE) win.shift();
+        const matches = win.filter(Boolean).length;
+        const stepComplete =
+          win.length >= REQUIRED_MATCHES && matches >= REQUIRED_MATCHES;
 
-        setMatchConfidence(
-          typeof analysis.matchConfidence === "number"
-            ? analysis.matchConfidence
-            : null
-        );
-        setFeedback(analysis.feedback || "");
-        setCorrections(
-          Array.isArray(analysis.ytCorrections) ? analysis.ytCorrections : []
-        );
-        if (typeof data.stepText === "string") setStepText(data.stepText);
+        const now = Date.now();
+        const isHoldingOllamaTip = now < ollamaHoldUntilRef.current;
 
-        pushStatusFromWindow();
-      } catch (err) {
-        failureCountRef.current += 1;
-        if (failureCountRef.current >= MAX_CONSECUTIVE_FAILURES) {
-          setEngineOnline(false);
-          setStatus(CORRECTION_STATUS.ERROR);
-          // Clear stale corrections so we never show outdated guidance.
-          setFeedback("");
-          setCorrections([]);
-          setMatchConfidence(null);
-          matchWindowRef.current = [];
-          backoffUntilRef.current = performance.now() + BACKOFF_MS;
+        // 2. Debounce rule-based feedback text so the panel doesn't flicker every 500ms
+        if (stepComplete) {
+          pendingFeedbackRef.current = { text: "", count: 0 };
+          shownFeedbackRef.current = "Looking good — hold the position!";
+          violationStartTimeRef.current = null;
+          ollamaHoldUntilRef.current = 0;
+          setOllamaCoaching((prev) =>
+            prev.active || prev.loading ? INITIAL_OLLAMA_STATE : prev
+          );
+        } else if (!isHoldingOllamaTip) {
+          if (ollamaCoaching.active) {
+            setOllamaCoaching((prev) =>
+              prev.active ? { ...prev, active: false } : prev
+            );
+          }
+          const pend = pendingFeedbackRef.current;
+          if (feedback === pend.text) {
+            pend.count += 1;
+          } else {
+            pend.text = feedback;
+            pend.count = 1;
+          }
+          if (
+            pend.count >= FEEDBACK_DEBOUNCE_FRAMES ||
+            !shownFeedbackRef.current
+          ) {
+            shownFeedbackRef.current = feedback;
+          }
         }
+
+        // Build consolidated list of detected errors for UI + Ollama stuck-user context
+        const devPhrases = Array.isArray(descriptorDeviations)
+          ? descriptorDeviations.map((d) => d?.phrase).filter(Boolean)
+          : [];
+        const combinedErrors = Array.from(
+          new Set([...devPhrases, ...(ytCorrections || []), feedback].filter(Boolean))
+        ).filter((msg) => !msg.toLowerCase().includes("looking good"));
+        latestDetectedErrorsRef.current = combinedErrors;
+
+        // 3. Stuck-User Violation Timer (>= 3000 ms continuous violation triggers local Ollama coach)
+        if (!stepComplete) {
+          if (violationStartTimeRef.current === null) {
+            violationStartTimeRef.current = now;
+          } else if (now - violationStartTimeRef.current >= OLLAMA_STUCK_TRIGGER_MS) {
+            void triggerOllamaStuckCoaching(lm, combinedErrors);
+          }
+        }
+
+        setState({
+          status: stepComplete
+            ? CORRECTION_STATUS.GOOD_FORM
+            : CORRECTION_STATUS.ADJUST,
+          engineOnline: true,
+          matchConfidence,
+          feedback: shownFeedbackRef.current || feedback,
+          corrections: stepComplete
+            ? []
+            : isHoldingOllamaTip && ollamaCoaching.feedback
+            ? [
+                ollamaCoaching.feedback,
+                ...(ytCorrections || []).filter((c) => c !== ollamaCoaching.feedback),
+              ].slice(0, 4)
+            : ytCorrections,
+          stepText: data.stepText || null,
+          idealLandmarks,
+          targetAngles,
+          liveAngles,
+          descriptorDeviations,
+          ytAngleScore,
+        });
+      } catch {
+        if (stopped) return;
+        setState((prev) => ({
+          ...prev,
+          status: CORRECTION_STATUS.ERROR,
+          engineOnline: false,
+        }));
       } finally {
-        clearTimeout(timeoutId);
-        abortRef.current = null;
         inFlightRef.current = false;
-        schedule(40);
       }
     };
 
-    function schedule(delay) {
-      if (stopped) return;
-      timer = window.setTimeout(tick, Math.max(0, delay));
-    }
-
-    schedule(0);
+    const intervalId = window.setInterval(tick, POLL_INTERVAL_MS);
+    void tick();
 
     return () => {
       stopped = true;
-      window.clearTimeout(timer);
-      if (abortRef.current) {
-        abortRef.current.abort();
-        abortRef.current = null;
-      }
+      window.clearInterval(intervalId);
       inFlightRef.current = false;
+      if (ollamaAbortRef.current) {
+        ollamaAbortRef.current.abort();
+        ollamaAbortRef.current = null;
+      }
     };
-  }, [active, supported, pushStatusFromWindow]);
+  }, [
+    active,
+    supported,
+    correctionPoseName,
+    currentStepIndex,
+    age,
+    ageGroup,
+    userName,
+    asanaReference,
+    trackingState,
+    ollamaCoaching.active,
+    ollamaCoaching.feedback,
+  ]);
 
   return {
     pushLandmarks,
-    status,
+    status: state.status,
     supported,
-    engineOnline,
-    matchConfidence, // 0..1 or null
-    feedback,
-    corrections,
-    stepText,
+    engineOnline: state.engineOnline,
+    matchConfidence: state.matchConfidence,
+    feedback: state.feedback,
+    corrections: state.corrections,
+    stepText: state.stepText,
+    idealLandmarks: state.idealLandmarks,
+    targetAngles: state.targetAngles,
+    liveAngles: state.liveAngles,
+    descriptorDeviations: state.descriptorDeviations,
+    ytAngleScore: state.ytAngleScore,
+    correctionPoseName,
+    ollamaCoaching,
+    ageGroup,
+    asanaReference,
   };
 }

@@ -34,6 +34,7 @@ import AppHardwarePage from "./Pages/app/AppHardwarePage";
 import AppPracticePage from "./Pages/app/AppPracticePage";
 import HistoryPage from "./Pages/app/HistoryPage";
 import PoseEstimationPage from "./Pages/PoseEstimation/PoseEstimationPage";
+import TwinTestHarness from "./Components/twins/TwinTestHarness";
 
 const App = () => {
   return (
@@ -60,6 +61,7 @@ const App = () => {
                 </Route>
               </Route>
               <Route path="/pose-estimation" element={<PoseEstimationPage />} />
+              <Route path="/twin-test" element={<TwinTestHarness />} />
               <Route path="/login" element={<LoginPage />} />
               <Route path="/practice/consent" element={<PracticeConsentPage />} />
               <Route

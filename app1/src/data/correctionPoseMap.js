@@ -1,16 +1,9 @@
 /**
- * Maps the app's pose names (src/data/poses.js) to the exact pose names the
- * Yoga Pose Correction engine was trained on (its GET /api/poses `name` field,
- * which is Sanskrit-qualified, e.g. "Tadasana (Mountain Pose)").
- *
- * Only poses the engine actually supports are listed. Poses with no trained
- * equivalent (e.g. "Wind-Relieving Pose" / Pavanamukthasana) are intentionally
- * absent — getCorrectionPoseName() returns null for those so the UI can show a
- * clear "correction unavailable for this pose" state instead of guessing.
- *
- * Verified against the engine's labels.json (74 step classes across 13 poses).
+ * Maps the app's 9 supported pose names and Sanskrit names (src/data/poses.js)
+ * to the exact pose names served by the Yoga Pose Correction engine (`correction-engine/server.js`).
  */
 export const APP_TO_CORRECTION_POSE = {
+  // English names from src/data/poses.js
   "Mountain Pose": "Tadasana (Mountain Pose)",
   "Tree Pose": "Vrkasana (Tree Pose)",
   "Hand-to-Foot Pose": "Pada-hastasana (Hand-to-Foot Pose)",
@@ -18,12 +11,26 @@ export const APP_TO_CORRECTION_POSE = {
   "Triangle Pose": "Trikonasana (Triangle Pose)",
   "Half Camel Pose": "Ardha Ustrasana (Half Camel Pose)",
   "Twisted Pose": "Vakrasana (Twisted Pose)",
+  "Wind-Relieving Pose": "Pavanamukthasana (Wind-Relieving Pose)",
   "Corpse Pose": "Savasana (Corpse Pose)",
-  // "Wind-Relieving Pose" (Pavanamukthasana): no trained equivalent → unsupported.
+
+  // Exact Sanskrit names for the 9 supported asanas
+  "Tadasana": "Tadasana (Mountain Pose)",
+  "Vrikshasana": "Vrkasana (Tree Pose)",
+  "Vrksasana": "Vrkasana (Tree Pose)",
+  "Padahastasana": "Pada-hastasana (Hand-to-Foot Pose)",
+  "Pada Hastasana": "Pada-hastasana (Hand-to-Foot Pose)",
+  "Ardha Chakrasana": "Ardha Cakrasana (Half-Wheel Pose)",
+  "Trikonasana": "Trikonasana (Triangle Pose)",
+  "Ardha Ushtrasana": "Ardha Ustrasana (Half Camel Pose)",
+  "Ardha Ustrasana": "Ardha Ustrasana (Half Camel Pose)",
+  "Vakrasana": "Vakrasana (Twisted Pose)",
+  "Pavanamukthasana": "Pavanamukthasana (Wind-Relieving Pose)",
+  "Savasana": "Savasana (Corpse Pose)",
 };
 
 /**
- * @param {string} appPoseName - a pose `name` from src/data/poses.js
+ * @param {string} appPoseName - a pose `name` or `sanskrit` from src/data/poses.js
  * @returns {string|null} the engine pose name, or null if unsupported
  */
 export function getCorrectionPoseName(appPoseName) {
